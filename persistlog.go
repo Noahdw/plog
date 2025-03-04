@@ -11,16 +11,18 @@ import (
 
 type PersistentLog struct {
 	file        *os.File
+	filename    string
 	maxLogIndex int
 }
 
-func NewPeristentLog() (*PersistentLog, error) {
-	file, err := os.OpenFile("log.dat", os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
+func NewPeristentLog(filename string) (*PersistentLog, error) {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("could not open log %v", err)
 	}
 	plog := PersistentLog{
-		file: file,
+		file:     file,
+		filename: filename,
 	}
 	err = plog.readLogFromFile()
 	if err != nil {
@@ -37,7 +39,7 @@ func (p *PersistentLog) StoreValue(value string) {
 	binary.BigEndian.PutUint32(dataLenbuf, uint32(dataLen))
 
 	// Write checksum first followed by the (length of value + value)
-	checksum := getChecksum([]byte(value), dataLenbuf)
+	checksum := getChecksum(dataLenbuf, []byte(value))
 	msgToWrite := append(checksum, dataLenbuf...)
 	msgToWrite = append(msgToWrite, []byte(value)...)
 	p.file.Write(msgToWrite)
@@ -45,11 +47,22 @@ func (p *PersistentLog) StoreValue(value string) {
 	p.maxLogIndex += 1
 }
 
+func (p *PersistentLog) MaxLogIndex() int {
+	return p.maxLogIndex
+}
+
+func (p *PersistentLog) Close() {
+	if p.file != nil {
+		p.file.Close()
+	}
+}
+
 func (p *PersistentLog) readLogFromFile() error {
-	file, err := os.OpenFile("log.dat", os.O_RDWR, 0666)
+	file, err := os.OpenFile(p.filename, os.O_RDWR, 0666)
 	if err != nil {
 		return nil
 	}
+	defer file.Close()
 	// Get file size
 	fileInfo, err := file.Stat()
 	if err != nil {
@@ -105,7 +118,7 @@ func (p *PersistentLog) readLogFromFile() error {
 		}
 		fmt.Printf("content: %s\n", dataContent)
 
-		computedChecksum := getChecksum(dataContent, rawDataLen)
+		computedChecksum := getChecksum(rawDataLen, dataContent)
 		if !bytes.Equal(computedChecksum, checksum) {
 			break
 		}
@@ -115,7 +128,6 @@ func (p *PersistentLog) readLogFromFile() error {
 		lastValidPos = pos
 	}
 
-	file.Close()
 	// Clean up (remove) entries that are invalid or come after an invalid one
 	if lastValidPos < int(filesize) {
 		fmt.Printf("Truncate: %d %d\n", lastValidPos, filesize)
@@ -128,17 +140,33 @@ func (p *PersistentLog) readLogFromFile() error {
 	return nil
 }
 
-func (p *PersistentLog) GetMaxLogIndex() int {
-	return p.maxLogIndex
-}
+// For use by tests
+// bytesToRemove is the length that will get removed from disk, corrupting the entry
+func (p *PersistentLog) storeCorruptedValue(value string, bytesToRemove int64) error {
+	p.StoreValue(value)
 
-func (p *PersistentLog) Close() {
-	if p.file != nil {
-		p.file.Close()
+	fileInfo, err := os.Stat(p.file.Name())
+	if err != nil {
+		return fmt.Errorf("error getting file info: %w", err)
 	}
+	currentSize := fileInfo.Size()
+
+	// Calculate new size
+	newSize := currentSize - bytesToRemove
+	if newSize < 0 {
+		return fmt.Errorf("cannot remove %d bytes, file is only %d bytes", bytesToRemove, currentSize)
+	}
+
+	// Truncate the file to the new size
+	err = os.Truncate(p.file.Name(), newSize)
+	if err != nil {
+		return fmt.Errorf("error truncating file: %w", err)
+	}
+	p.file.Sync()
+	return nil
 }
 
-func getChecksum(value []byte, valueLen []byte) []byte {
+func getChecksum(valueLen []byte, value []byte) []byte {
 	// Crease a checksum based on the concat of :
 	// 1. Length of the value, expressed in a byte buffer of size 4 (int)
 	// 2. The value to be stored
